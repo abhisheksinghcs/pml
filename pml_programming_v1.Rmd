@@ -1,0 +1,240 @@
+#Programming Assignment
+
+##Objective
+Goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants and predict the manner in which they did the exercise. 
+
+This report describes:
+
+1. How you built your model, 
+2. How you used cross validation,
+3. What you think the expected out of sample error is, and 
+4. Why you made the choices you did. 
+
+*Assuming that the pml-training.csv and pml-testing.csv are in current directory*
+
+```{r readData, cache=TRUE}
+set.seed(3343)
+library(caret); library(e1071); library(ggplot2);library(rattle)
+training <- read.csv(file = "./pml-training.csv", header = TRUE)
+testing <- read.csv(file = "./pml-testing.csv", header = TRUE)
+```
+
+##Develop the model
+
+### How to select the features
+There are current 160 features in the training dataset. We will filter out the ones that:
+1. Don't have variance (near zero)
+2. Have more than 20% 'NA' values
+3. Identify the variables that are highly correlated and combine them using PCA to capture 90% variance. We see that there are 22 features that are highly correlated.
+
+
+```{r createFeatures, cache=TRUE, echo=FALSE}
+## Remove features that don't have variance
+filter <- nearZeroVar(training)
+trainingFiltered <- training[, -filter]
+
+
+
+## Remove the features that has more than 20% NA
+
+nullFeatures <- NULL
+
+for(i in 1:dim(trainingFiltered)[2]){
+        if((sum(is.na(trainingFiltered[,i]))/dim(trainingFiltered)[1]) > 0.20) {
+                nullFeatures <- c(nullFeatures,i) 
+                }
+        
+        }
+
+trainingFiltered <- trainingFiltered[, -nullFeatures]
+
+## So we have reduced the feature set to 59 features from 160
+
+## Let's identify the features that are highly corelated (Cor > 0.8)
+
+x <- sapply(trainingFiltered,is.numeric)
+trainingFilteredNumeric <- trainingFiltered[, x]
+M <- abs(cor(trainingFilteredNumeric))
+diag(M) <- 0
+
+## Total number of highly correlated features = 22
+# dim(which(M > 0.8, arr.ind = TRUE))
+
+```
+
+
+We will Pre-Process the data sets to replace corelated features with PCA components
+
+```{r pcaFeatures, cache=TRUE}
+###              Make PCA features              ####
+
+## Identiy the most corelated features
+
+prIdx <- which(M > 0.8, useNames = FALSE, arr.ind = TRUE)[,1]
+pcaFeat <- trainingFiltered[, unique(prIdx)]
+## Remove the non-numeric feature
+pcaFeat <- pcaFeat[, -7]
+
+## Generate PCA features for training data
+preProc <- preProcess(pcaFeat, method = "pca", thresh = 0.9, pcaComp = 2)
+pcaComp <- predict(preProc, pcaFeat)
+
+## We do the same operation on Testing dataset
+## Filter the test dataset for the PCA variables so we can use the same PreProcess
+## object
+
+testPCA <- testing[, names(pcaFeat)]
+## Now make the PCA components for Test dataset
+testPCAComp <- predict(preProc,testPCA)
+
+## Update the test and training datasets with the PCA components
+## This will not impact the testing data validity as we are performing the 
+## same operation as we did on the Training data
+
+testingNames <- names(testing)
+selectNames <- setdiff(testingNames, names(pcaFeat))
+testingFiltered <- testing[, selectNames]
+## Now add PCA components to Test data
+testingFiltered <- cbind(testingFiltered, testPCAComp)
+
+## Doing the same for Training data
+
+trainingNames <- names(trainingFiltered)
+selectTrainNames <- setdiff(testingNames, names(pcaFeat))
+trainingNew <- cbind(trainingFiltered, pcaComp)
+
+###              PCA features Added              ####
+
+
+
+
+```
+
+
+###Developing model and out of sample error computation using cross validation
+
+Since this is a classification problem we can leverage **tree** based algorithms and compare it with another non-linear separator like SVM.
+
+**Estimate the expected out of sample error**
+
+We will use k (= 5) folds to estimate the out of sample error. We will create a new Validation dataset using the Training data and cross validate on the validation using K-Folds.
+
+
+```{r modelDevelopmentAndCrossValidation, cache=TRUE}
+
+###             Define the model & Cross Validate                ###
+set.seed(3343)
+## Keeping a low k due to computation limitations else would do k = 10
+
+k <- 5
+folds <- createFolds(y = trainingNew$classe, k = k, list = FALSE, returnTrain = FALSE)
+
+trainingNew$fold <- folds
+
+## Define the data frame for recording CV errors 
+
+errEst <- data.frame(erf = rep(NA, k), esvm = rep(NA, k))
+
+## Perform CV using K folds
+
+library(e1071); library(randomForest)
+
+for (i in 1:k){
+        
+        trainingTmp <- subset(trainingNew, fold != i, select = -fold)
+        validation <- subset(trainingNew, fold == i, select = -fold)
+        
+        fitTree <- randomForest(classe ~ . , data = trainingTmp, ntree = 100, proximity = TRUE)
+        
+        fitSVM <- svm(data = trainingTmp, classe ~ .)
+        
+        predTree <- predict(fitTree, validation)
+        predSVM <- predict(fitSVM, validation)
+        
+        validation$predTreeRight <- predTree == validation$classe
+        validation$predSVMRight <- predSVM == validation$classe
+        
+        ## Count the misclassified predictions
+        errEst$erf[i] <- sum(!validation$predTreeRight)
+        errEst$esvm[i] <- sum(!validation$predSVMRight)
+}
+
+## Estimate out of sample errors:
+meanTreeErr <- colMeans(errEst)[1]/dim(validation)[1]
+meanSVMErr <- colMeans(errEst)[2]/dim(validation)[1]
+
+###             Complete Model Definition                ###
+```
+
+The expected out of sample error rates are:
+
+* Random Forest - `r  meanTreeErr`
+* SVM - `r meanSVMErr`
+
+**Based on the error rates above we will use Random Forest as our classifier**
+
+
+
+##Test on the testing dataset
+
+In order to increase the efficiency we will try to use only the top 10 random forest
+features as identified by the varImp(fitTree). 
+
+```{r testPrediction, cache = TRUE}
+
+library(caret); library(randomForest); 
+set.seed(3343)
+## Identify most important variables
+impVars <- varImp(fitTree)
+impVars$varName <- rownames(varImp(fitTree))
+
+## Select the features that are common to both testing and training
+
+varIdx <- (impVars$varName %in% names(testingFiltered))
+
+## Common Variables
+commonVars <- (impVars$varName)[varIdx]
+
+impVars <- impVars[varIdx,]
+
+## Since Random Forest doesn't consider PCA components important we can 
+## ignorethem
+
+## Only select top 10 most important variables
+
+vars <- head(impVars, 10)[,2]
+
+## New training set with only top 10 features
+trainingImpVars <- trainingFiltered[, vars]
+trainingImpVars$classe <- trainingFiltered$classe
+
+inBuild <- createDataPartition(y = trainingImpVars$classe, p = 0.7, list = FALSE)
+
+trainTree <- trainingImpVars[inBuild,]
+validationTree <- trainingImpVars[-inBuild,]
+
+
+## Let's fit the tree now
+
+fitTreeNew <- train(classe ~., data = trainTree, method = 'rf')
+
+predV <- predict(fitTreeNew, validationTree)
+
+errNew <- sum(predV != validationTree$classe)
+
+testingNew <- testingFiltered[, vars]
+#testingNew$classe <- rep(NA, dim(testingNew)[1])
+
+# levels(testingNew$cvtd_timestamp) <- levels(trainingImpVars$cvtd_timestamp)
+# levels(testingNew$cvtd_timestamp) <- levels(trainingImpVars$cvtd_timestamp)
+
+
+predT <- predict(fitTreeNew, testingFiltered)
+
+```
+
+*Predicted Test Values*
+
+```{r, cache=TRUE}
+table(predT)
+```
